@@ -1,192 +1,191 @@
 const express = require('express');
 const cors = require('cors');
-const sqlite3 = require('sqlite3').verbose();
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const path = require('path');
+const { Pool } = require('pg');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-const JWT_SECRET = process.env.JWT_SECRET || 'tu-secreto-super-seguro-cambiar-en-produccion';
+const JWT_SECRET = process.env.JWT_SECRET || 'ac-maintenance-secret-2024';
 
 app.use(cors());
 app.use(express.json());
 
-// Database setup
-const dbPath = process.env.NODE_ENV === 'production' 
-  ? '/opt/render/project/src/database.sqlite'
-  : path.join(__dirname, 'database.sqlite');
-
-const db = new sqlite3.Database(dbPath, (err) => {
-  if (err) {
-    console.error('Error opening database:', err);
-  } else {
-    console.log('Database connected');
-    initDatabase();
-  }
+// PostgreSQL connection
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
 // Initialize database
-function initDatabase() {
-  db.serialize(() => {
+async function initDatabase() {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
     // Users table
-    db.run(`CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      username TEXT UNIQUE NOT NULL,
-      password TEXT NOT NULL,
-      role TEXT NOT NULL,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        username VARCHAR(255) UNIQUE NOT NULL,
+        password VARCHAR(255) NOT NULL,
+        role VARCHAR(50) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
 
     // Technicians table
-    db.run(`CREATE TABLE IF NOT EXISTS technicians (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      phone TEXT,
-      email TEXT,
-      specialization TEXT,
-      status TEXT DEFAULT 'active',
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS technicians (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        phone VARCHAR(50),
+        email VARCHAR(255),
+        specialization VARCHAR(100),
+        status VARCHAR(50) DEFAULT 'active',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
 
     // Clients table
-    db.run(`CREATE TABLE IF NOT EXISTS clients (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      phone TEXT,
-      email TEXT,
-      address TEXT,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS clients (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        phone VARCHAR(50),
+        email VARCHAR(255),
+        address TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
 
     // Work orders table
-    db.run(`CREATE TABLE IF NOT EXISTS work_orders (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      client_id INTEGER,
-      technician_id INTEGER,
-      title TEXT NOT NULL,
-      description TEXT,
-      status TEXT DEFAULT 'pending',
-      priority TEXT DEFAULT 'normal',
-      scheduled_date DATE,
-      scheduled_time TEXT,
-      completed_at DATETIME,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (client_id) REFERENCES clients(id),
-      FOREIGN KEY (technician_id) REFERENCES technicians(id)
-    )`);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS work_orders (
+        id SERIAL PRIMARY KEY,
+        client_id INTEGER REFERENCES clients(id),
+        technician_id INTEGER REFERENCES technicians(id),
+        title VARCHAR(255) NOT NULL,
+        description TEXT,
+        status VARCHAR(50) DEFAULT 'pending',
+        priority VARCHAR(50) DEFAULT 'normal',
+        scheduled_date DATE,
+        scheduled_time VARCHAR(20),
+        completed_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
 
     // Materials table
-    db.run(`CREATE TABLE IF NOT EXISTS materials (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      description TEXT,
-      stock INTEGER DEFAULT 0,
-      unit TEXT,
-      min_stock INTEGER DEFAULT 5,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS materials (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        description TEXT,
+        stock INTEGER DEFAULT 0,
+        unit VARCHAR(50),
+        min_stock INTEGER DEFAULT 5,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
 
     // Work order materials table
-    db.run(`CREATE TABLE IF NOT EXISTS work_order_materials (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      work_order_id INTEGER,
-      material_id INTEGER,
-      quantity INTEGER NOT NULL,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (work_order_id) REFERENCES work_orders(id),
-      FOREIGN KEY (material_id) REFERENCES materials(id)
-    )`);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS work_order_materials (
+        id SERIAL PRIMARY KEY,
+        work_order_id INTEGER REFERENCES work_orders(id) ON DELETE CASCADE,
+        material_id INTEGER REFERENCES materials(id),
+        quantity INTEGER NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
 
-    // Technician availability table
-    db.run(`CREATE TABLE IF NOT EXISTS technician_availability (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      technician_id INTEGER,
-      date DATE NOT NULL,
-      available BOOLEAN DEFAULT 1,
-      notes TEXT,
-      FOREIGN KEY (technician_id) REFERENCES technicians(id)
-    )`);
+    await client.query('COMMIT');
+    console.log('✅ Database tables created');
 
-    // Seed initial data
-    seedData();
-  });
+    await seedData(client);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Database initialization error:', err);
+  } finally {
+    client.release();
+  }
 }
 
-function seedData() {
-  // Check if admin exists
-  db.get('SELECT * FROM users WHERE username = ?', ['admin'], (err, row) => {
-    if (!row) {
-      const hashedPassword = bcrypt.hashSync('admin', 10);
-      db.run('INSERT INTO users (username, password, role) VALUES (?, ?, ?)', 
-        ['admin', hashedPassword, 'admin']);
-      console.log('Admin user created');
+async function seedData(client) {
+  try {
+    // Check if admin exists
+    const adminCheck = await client.query('SELECT * FROM users WHERE username = $1', ['admin']);
+    
+    if (adminCheck.rows.length === 0) {
+      const hashedPassword = bcrypt.hashSync('Admin2025!', 10);
+      await client.query(
+        'INSERT INTO users (username, password, role) VALUES ($1, $2, $3)',
+        ['admin', hashedPassword, 'admin']
+      );
+      console.log('✅ Admin user created (admin/Admin2025!)');
     }
-  });
 
-  // Add sample technicians
-  db.get('SELECT COUNT(*) as count FROM technicians', (err, row) => {
-    if (row.count === 0) {
+    // Sample technicians
+    const techCheck = await client.query('SELECT COUNT(*) as count FROM technicians');
+    if (parseInt(techCheck.rows[0].count) === 0) {
       const technicians = [
-        ['Juan Pérez', '+506 8888-1111', 'juan@email.com', 'Residencial'],
-        ['María González', '+506 8888-2222', 'maria@email.com', 'Comercial'],
-        ['Carlos Rodríguez', '+506 8888-3333', 'carlos@email.com', 'Industrial'],
+        ['Juan Pérez', '+506-8888-1111', 'juan@email.com', 'Residencial'],
+        ['María González', '+506-8888-2222', 'maria@email.com', 'Comercial'],
+        ['Carlos Rodríguez', '+506-8888-3333', 'carlos@email.com', 'Industrial']
       ];
       
-      technicians.forEach(tech => {
-        db.run('INSERT INTO technicians (name, phone, email, specialization) VALUES (?, ?, ?, ?)', tech);
-      });
-      console.log('Sample technicians created');
+      for (const tech of technicians) {
+        await client.query(
+          'INSERT INTO technicians (name, phone, email, specialization) VALUES ($1, $2, $3, $4)',
+          tech
+        );
+      }
+      console.log('✅ Sample technicians created');
     }
-  });
 
-  // Add sample materials
-  db.get('SELECT COUNT(*) as count FROM materials', (err, row) => {
-    if (row.count === 0) {
+    // Sample materials
+    const matCheck = await client.query('SELECT COUNT(*) as count FROM materials');
+    if (parseInt(matCheck.rows[0].count) === 0) {
       const materials = [
-        ['Gas R-410A', 'Refrigerante para AC', 20, 'kg', 5],
+        ['Gas R-410A', 'Refrigerante', 20, 'kg', 5],
         ['Filtros de aire', 'Filtros estándar', 50, 'unidad', 10],
-        ['Capacitor', 'Capacitor universal', 15, 'unidad', 5],
-        ['Tuberías de cobre', 'Tubo 1/4"', 100, 'metros', 20],
-        ['Cable eléctrico', 'Cable calibre 12', 200, 'metros', 30],
+        ['Capacitor', 'Universal', 15, 'unidad', 5]
       ];
       
-      materials.forEach(mat => {
-        db.run('INSERT INTO materials (name, description, stock, unit, min_stock) VALUES (?, ?, ?, ?, ?)', mat);
-      });
-      console.log('Sample materials created');
+      for (const mat of materials) {
+        await client.query(
+          'INSERT INTO materials (name, description, stock, unit, min_stock) VALUES ($1, $2, $3, $4, $5)',
+          mat
+        );
+      }
+      console.log('✅ Sample materials created');
     }
-  });
+  } catch (err) {
+    console.error('Seed data error:', err);
+  }
 }
 
-// Middleware to verify JWT
+// Auth middleware
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
 
-  if (!token) {
-    return res.status(401).json({ error: 'Access denied' });
-  }
+  if (!token) return res.status(401).json({ error: 'Access denied' });
 
   jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) {
-      return res.status(403).json({ error: 'Invalid token' });
-    }
+    if (err) return res.status(403).json({ error: 'Invalid token' });
     req.user = user;
     next();
   });
 }
 
 // Routes
-
-// Auth
-app.post('/api/login', (req, res) => {
+app.post('/api/login', async (req, res) => {
   const { username, password } = req.body;
-
-  db.get('SELECT * FROM users WHERE username = ?', [username], (err, user) => {
-    if (err) {
-      return res.status(500).json({ error: 'Database error' });
-    }
+  try {
+    const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+    const user = result.rows[0];
 
     if (!user || !bcrypt.compareSync(password, user.password)) {
       return res.status(401).json({ error: 'Invalid credentials' });
@@ -200,256 +199,248 @@ app.post('/api/login', (req, res) => {
 
     res.json({
       token,
-      user: {
-        id: user.id,
-        username: user.username,
-        role: user.role
-      }
+      user: { id: user.id, username: user.username, role: user.role }
     });
-  });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// Technicians
-app.get('/api/technicians', authenticateToken, (req, res) => {
-  db.all('SELECT * FROM technicians ORDER BY name', (err, rows) => {
-    if (err) {
-      return res.status(500).json({ error: err.message });
-    }
-    res.json(rows);
-  });
-});
-
-app.post('/api/technicians', authenticateToken, (req, res) => {
-  const { name, phone, email, specialization } = req.body;
-  
-  db.run('INSERT INTO technicians (name, phone, email, specialization) VALUES (?, ?, ?, ?)',
-    [name, phone, email, specialization],
-    function(err) {
-      if (err) {
-        return res.status(500).json({ error: err.message });
-      }
-      res.json({ id: this.lastID, name, phone, email, specialization, status: 'active' });
-    }
-  );
-});
-
-app.put('/api/technicians/:id', authenticateToken, (req, res) => {
-  const { name, phone, email, specialization, status } = req.body;
-  
-  db.run('UPDATE technicians SET name = ?, phone = ?, email = ?, specialization = ?, status = ? WHERE id = ?',
-    [name, phone, email, specialization, status, req.params.id],
-    function(err) {
-      if (err) {
-        return res.status(500).json({ error: err.message });
-      }
-      res.json({ message: 'Technician updated' });
-    }
-  );
-});
-
-app.delete('/api/technicians/:id', authenticateToken, (req, res) => {
-  db.run('DELETE FROM technicians WHERE id = ?', [req.params.id], function(err) {
-    if (err) {
-      return res.status(500).json({ error: err.message });
-    }
-    res.json({ message: 'Technician deleted' });
-  });
-});
-
-// Clients
-app.get('/api/clients', authenticateToken, (req, res) => {
-  db.all('SELECT * FROM clients ORDER BY name', (err, rows) => {
-    if (err) {
-      return res.status(500).json({ error: err.message });
-    }
-    res.json(rows);
-  });
-});
-
-app.post('/api/clients', authenticateToken, (req, res) => {
-  const { name, phone, email, address } = req.body;
-  
-  db.run('INSERT INTO clients (name, phone, email, address) VALUES (?, ?, ?, ?)',
-    [name, phone, email, address],
-    function(err) {
-      if (err) {
-        return res.status(500).json({ error: err.message });
-      }
-      res.json({ id: this.lastID, name, phone, email, address });
-    }
-  );
-});
-
-// Work Orders
-app.get('/api/work-orders', authenticateToken, (req, res) => {
-  const query = `
-    SELECT wo.*, 
-           c.name as client_name,
-           t.name as technician_name
-    FROM work_orders wo
-    LEFT JOIN clients c ON wo.client_id = c.id
-    LEFT JOIN technicians t ON wo.technician_id = t.id
-    ORDER BY wo.created_at DESC
-  `;
-  
-  db.all(query, (err, rows) => {
-    if (err) {
-      return res.status(500).json({ error: err.message });
-    }
-    res.json(rows);
-  });
-});
-
-app.post('/api/work-orders', authenticateToken, (req, res) => {
-  const { client_id, technician_id, title, description, status, priority, scheduled_date, scheduled_time } = req.body;
-  
-  db.run(`INSERT INTO work_orders 
-    (client_id, technician_id, title, description, status, priority, scheduled_date, scheduled_time) 
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    [client_id, technician_id, title, description, status, priority, scheduled_date, scheduled_time],
-    function(err) {
-      if (err) {
-        return res.status(500).json({ error: err.message });
-      }
-      res.json({ id: this.lastID });
-    }
-  );
-});
-
-app.put('/api/work-orders/:id', authenticateToken, (req, res) => {
-  const { client_id, technician_id, title, description, status, priority, scheduled_date, scheduled_time } = req.body;
-  
-  db.run(`UPDATE work_orders 
-    SET client_id = ?, technician_id = ?, title = ?, description = ?, 
-        status = ?, priority = ?, scheduled_date = ?, scheduled_time = ?
-    WHERE id = ?`,
-    [client_id, technician_id, title, description, status, priority, scheduled_date, scheduled_time, req.params.id],
-    function(err) {
-      if (err) {
-        return res.status(500).json({ error: err.message });
-      }
-      res.json({ message: 'Work order updated' });
-    }
-  );
-});
-
-app.delete('/api/work-orders/:id', authenticateToken, (req, res) => {
-  db.run('DELETE FROM work_orders WHERE id = ?', [req.params.id], function(err) {
-    if (err) {
-      return res.status(500).json({ error: err.message });
-    }
-    res.json({ message: 'Work order deleted' });
-  });
-});
-
-// Materials
-app.get('/api/materials', authenticateToken, (req, res) => {
-  db.all('SELECT * FROM materials ORDER BY name', (err, rows) => {
-    if (err) {
-      return res.status(500).json({ error: err.message });
-    }
-    res.json(rows);
-  });
-});
-
-app.post('/api/materials', authenticateToken, (req, res) => {
-  const { name, description, stock, unit, min_stock } = req.body;
-  
-  db.run('INSERT INTO materials (name, description, stock, unit, min_stock) VALUES (?, ?, ?, ?, ?)',
-    [name, description, stock, unit, min_stock],
-    function(err) {
-      if (err) {
-        return res.status(500).json({ error: err.message });
-      }
-      res.json({ id: this.lastID, name, description, stock, unit, min_stock });
-    }
-  );
-});
-
-app.put('/api/materials/:id', authenticateToken, (req, res) => {
-  const { name, description, stock, unit, min_stock } = req.body;
-  
-  db.run('UPDATE materials SET name = ?, description = ?, stock = ?, unit = ?, min_stock = ? WHERE id = ?',
-    [name, description, stock, unit, min_stock, req.params.id],
-    function(err) {
-      if (err) {
-        return res.status(500).json({ error: err.message });
-      }
-      res.json({ message: 'Material updated' });
-    }
-  );
-});
-
-app.delete('/api/materials/:id', authenticateToken, (req, res) => {
-  db.run('DELETE FROM materials WHERE id = ?', [req.params.id], function(err) {
-    if (err) {
-      return res.status(500).json({ error: err.message });
-    }
-    res.json({ message: 'Material deleted' });
-  });
-});
-
-// Work Order Materials
-app.get('/api/work-orders/:id/materials', authenticateToken, (req, res) => {
-  const query = `
-    SELECT wom.*, m.name, m.unit
-    FROM work_order_materials wom
-    JOIN materials m ON wom.material_id = m.id
-    WHERE wom.work_order_id = ?
-  `;
-  
-  db.all(query, [req.params.id], (err, rows) => {
-    if (err) {
-      return res.status(500).json({ error: err.message });
-    }
-    res.json(rows);
-  });
-});
-
-app.post('/api/work-orders/:id/materials', authenticateToken, (req, res) => {
-  const { material_id, quantity } = req.body;
-  const work_order_id = req.params.id;
-  
-  // Insert material usage
-  db.run('INSERT INTO work_order_materials (work_order_id, material_id, quantity) VALUES (?, ?, ?)',
-    [work_order_id, material_id, quantity],
-    function(err) {
-      if (err) {
-        return res.status(500).json({ error: err.message });
-      }
-      
-      // Update material stock
-      db.run('UPDATE materials SET stock = stock - ? WHERE id = ?',
-        [quantity, material_id],
-        function(err) {
-          if (err) {
-            return res.status(500).json({ error: err.message });
-          }
-          res.json({ id: this.lastID, message: 'Material added and stock updated' });
-        }
-      );
-    }
-  );
-});
-
-// Health check
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'OK', timestamp: new Date().toISOString() });
-});
-// Backup endpoint (admin only)
-app.get('/api/backup', authenticateToken, (req, res) => {
+// Users management
+app.get('/api/users', authenticateToken, async (req, res) => {
   if (req.user.role !== 'admin') {
     return res.status(403).json({ error: 'Admin only' });
   }
-  
-  const fileName = `backup-${new Date().toISOString().split('T')[0]}.sqlite`;
-  res.download(dbPath, fileName, (err) => {
-    if (err) {
-      console.error('Backup error:', err);
-      res.status(500).json({ error: 'Backup failed' });
-    }
-  });
+  try {
+    const result = await pool.query('SELECT id, username, role, created_at FROM users ORDER BY username');
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+
+app.post('/api/users', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'admin') {
+    return res.status(403).json({ error: 'Admin only' });
+  }
+  const { username, password, role } = req.body;
+  try {
+    const hashedPassword = bcrypt.hashSync(password, 10);
+    const result = await pool.query(
+      'INSERT INTO users (username, password, role) VALUES ($1, $2, $3) RETURNING id, username, role',
+      [username, hashedPassword, role]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put('/api/users/:id', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'admin') {
+    return res.status(403).json({ error: 'Admin only' });
+  }
+  const { password, role } = req.body;
+  try {
+    if (password) {
+      const hashedPassword = bcrypt.hashSync(password, 10);
+      await pool.query(
+        'UPDATE users SET password = $1, role = $2 WHERE id = $3',
+        [hashedPassword, role, req.params.id]
+      );
+    } else {
+      await pool.query('UPDATE users SET role = $1 WHERE id = $2', [role, req.params.id]);
+    }
+    res.json({ message: 'User updated' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/users/:id', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'admin') {
+    return res.status(403).json({ error: 'Admin only' });
+  }
+  try {
+    await pool.query('DELETE FROM users WHERE id = $1', [req.params.id]);
+    res.json({ message: 'User deleted' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Technicians
+app.get('/api/technicians', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM technicians ORDER BY name');
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/technicians', authenticateToken, async (req, res) => {
+  const { name, phone, email, specialization } = req.body;
+  try {
+    const result = await pool.query(
+      'INSERT INTO technicians (name, phone, email, specialization) VALUES ($1, $2, $3, $4) RETURNING *',
+      [name, phone, email, specialization]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put('/api/technicians/:id', authenticateToken, async (req, res) => {
+  const { name, phone, email, specialization, status } = req.body;
+  try {
+    await pool.query(
+      'UPDATE technicians SET name=$1, phone=$2, email=$3, specialization=$4, status=$5 WHERE id=$6',
+      [name, phone, email, specialization, status, req.params.id]
+    );
+    res.json({ message: 'Updated' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/technicians/:id', authenticateToken, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM technicians WHERE id=$1', [req.params.id]);
+    res.json({ message: 'Deleted' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Clients
+app.get('/api/clients', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM clients ORDER BY name');
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/clients', authenticateToken, async (req, res) => {
+  const { name, phone, email, address } = req.body;
+  try {
+    const result = await pool.query(
+      'INSERT INTO clients (name, phone, email, address) VALUES ($1, $2, $3, $4) RETURNING *',
+      [name, phone, email, address]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Work Orders
+app.get('/api/work-orders', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT wo.*, c.name as client_name, t.name as technician_name
+      FROM work_orders wo
+      LEFT JOIN clients c ON wo.client_id = c.id
+      LEFT JOIN technicians t ON wo.technician_id = t.id
+      ORDER BY wo.created_at DESC
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/work-orders', authenticateToken, async (req, res) => {
+  const { client_id, technician_id, title, description, status, priority, scheduled_date, scheduled_time } = req.body;
+  try {
+    const result = await pool.query(
+      `INSERT INTO work_orders (client_id, technician_id, title, description, status, priority, scheduled_date, scheduled_time) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+      [client_id, technician_id, title, description, status, priority, scheduled_date, scheduled_time]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put('/api/work-orders/:id', authenticateToken, async (req, res) => {
+  const { client_id, technician_id, title, description, status, priority, scheduled_date, scheduled_time } = req.body;
+  try {
+    await pool.query(
+      `UPDATE work_orders SET client_id=$1, technician_id=$2, title=$3, description=$4, status=$5, priority=$6, scheduled_date=$7, scheduled_time=$8 WHERE id=$9`,
+      [client_id, technician_id, title, description, status, priority, scheduled_date, scheduled_time, req.params.id]
+    );
+    res.json({ message: 'Updated' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/work-orders/:id', authenticateToken, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM work_orders WHERE id=$1', [req.params.id]);
+    res.json({ message: 'Deleted' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Materials
+app.get('/api/materials', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM materials ORDER BY name');
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/materials', authenticateToken, async (req, res) => {
+  const { name, description, stock, unit, min_stock } = req.body;
+  try {
+    const result = await pool.query(
+      'INSERT INTO materials (name, description, stock, unit, min_stock) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+      [name, description, stock, unit, min_stock]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put('/api/materials/:id', authenticateToken, async (req, res) => {
+  const { name, description, stock, unit, min_stock } = req.body;
+  try {
+    await pool.query(
+      'UPDATE materials SET name=$1, description=$2, stock=$3, unit=$4, min_stock=$5 WHERE id=$6',
+      [name, description, stock, unit, min_stock, req.params.id]
+    );
+    res.json({ message: 'Updated' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/materials/:id', authenticateToken, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM materials WHERE id=$1', [req.params.id]);
+    res.json({ message: 'Deleted' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'OK', timestamp: new Date().toISOString() });
+});
+
+// Initialize and start server
+initDatabase().then(() => {
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`✅ Server running on port ${PORT}`);
+  });
 });

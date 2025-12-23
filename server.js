@@ -520,6 +520,27 @@ app.delete('/api/materials/:id', authenticateToken, async (req, res) => {
 app.get('/api/health', (req, res) => {
   res.json({ status: 'OK', timestamp: new Date().toISOString() });
 });
+app.put('/api/clients/:id', authenticateToken, async (req, res) => {
+  const { name, phone, email, address } = req.body;
+  try {
+    await pool.query(
+      'UPDATE clients SET name=$1, phone=$2, email=$3, address=$4 WHERE id=$5',
+      [name, phone, email, address, req.params.id]
+    );
+    res.json({ message: 'Updated' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/clients/:id', authenticateToken, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM clients WHERE id=$1', [req.params.id]);
+    res.json({ message: 'Deleted' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // Initialize and start server
 initDatabase().then(() => {

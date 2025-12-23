@@ -165,7 +165,90 @@ async function seedData(client) {
     console.error('Seed data error:', err);
   }
 }
+// Backup/Restore endpoints
+app.get('/api/backup/export', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'admin') {
+    return res.status(403).json({ error: 'Admin only' });
+  }
+  
+  try {
+    const backup = {
+      version: '1.0',
+      date: new Date().toISOString(),
+      technicians: (await pool.query('SELECT * FROM technicians')).rows,
+      clients: (await pool.query('SELECT * FROM clients')).rows,
+      work_orders: (await pool.query('SELECT * FROM work_orders')).rows,
+      materials: (await pool.query('SELECT * FROM materials')).rows,
+      users: (await pool.query('SELECT id, username, role, created_at FROM users')).rows
+    };
+    
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', `attachment; filename=backup-${new Date().toISOString().split('T')[0]}.json`);
+    res.send(JSON.stringify(backup, null, 2));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
+app.post('/api/backup/restore', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'admin') {
+    return res.status(403).json({ error: 'Admin only' });
+  }
+  
+  const client = await pool.connect();
+  try {
+    const { technicians, clients, work_orders, materials } = req.body;
+    
+    await client.query('BEGIN');
+    
+    // Clear existing data (except users)
+    await client.query('DELETE FROM work_order_materials');
+    await client.query('DELETE FROM work_orders');
+    await client.query('DELETE FROM materials');
+    await client.query('DELETE FROM clients');
+    await client.query('DELETE FROM technicians');
+    
+    // Restore technicians
+    for (const tech of technicians || []) {
+      await client.query(
+        'INSERT INTO technicians (id, name, phone, email, specialization, status) VALUES ($1, $2, $3, $4, $5, $6)',
+        [tech.id, tech.name, tech.phone, tech.email, tech.specialization, tech.status]
+      );
+    }
+    
+    // Restore clients
+    for (const cli of clients || []) {
+      await client.query(
+        'INSERT INTO clients (id, name, phone, email, address) VALUES ($1, $2, $3, $4, $5)',
+        [cli.id, cli.name, cli.phone, cli.email, cli.address]
+      );
+    }
+    
+    // Restore materials
+    for (const mat of materials || []) {
+      await client.query(
+        'INSERT INTO materials (id, name, description, stock, unit, min_stock) VALUES ($1, $2, $3, $4, $5, $6)',
+        [mat.id, mat.name, mat.description, mat.stock, mat.unit, mat.min_stock]
+      );
+    }
+    
+    // Restore work orders
+    for (const wo of work_orders || []) {
+      await client.query(
+        'INSERT INTO work_orders (id, client_id, technician_id, title, description, status, priority, scheduled_date, scheduled_time) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)',
+        [wo.id, wo.client_id, wo.technician_id, wo.title, wo.description, wo.status, wo.priority, wo.scheduled_date, wo.scheduled_time]
+      );
+    }
+    
+    await client.query('COMMIT');
+    res.json({ message: 'Backup restored successfully' });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
 // Auth middleware
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];

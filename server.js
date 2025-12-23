@@ -436,7 +436,20 @@ app.post('/api/work-orders/:id/materials', authenticateToken, (req, res) => {
 app.get('/api/health', (req, res) => {
   res.json({ status: 'OK', timestamp: new Date().toISOString() });
 });
-
+// Backup endpoint (admin only)
+app.get('/api/backup', authenticateToken, (req, res) => {
+  if (req.user.role !== 'admin') {
+    return res.status(403).json({ error: 'Admin only' });
+  }
+  
+  const fileName = `backup-${new Date().toISOString().split('T')[0]}.sqlite`;
+  res.download(dbPath, fileName, (err) => {
+    if (err) {
+      console.error('Backup error:', err);
+      res.status(500).json({ error: 'Backup failed' });
+    }
+  });
+});
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });

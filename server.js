@@ -455,12 +455,57 @@ app.put('/api/materials/:id', authenticateToken, async (req, res) => {
   }
 });
 
-app.delete('/api/materials/:id', authenticateToken, async (req, res) => {
+// ==================== ADD/UPDATE WAREHOUSE INVENTORY ====================
+app.post('/api/warehouses/:id/inventory', authenticateToken, async (req, res) => {
+  const { material_id, quantity } = req.body;
+  const warehouse_id = req.params.id;
+  
   try {
-    await pool.query('DELETE FROM materials WHERE id=$1', [req.params.id]);
-    res.json({ message: 'Deleted' });
+    // Check if inventory entry exists
+    const existing = await pool.query(
+      'SELECT * FROM warehouse_inventory WHERE warehouse_id=$1 AND material_id=$2',
+      [warehouse_id, material_id]
+    );
+
+    if (existing.rows.length > 0) {
+      // Update existing inventory (replace with new quantity)
+      await pool.query(
+        'UPDATE warehouse_inventory SET quantity=$1 WHERE warehouse_id=$2 AND material_id=$3',
+        [quantity, warehouse_id, material_id]
+      );
+    } else {
+      // Create new inventory entry
+      await pool.query(
+        'INSERT INTO warehouse_inventory (warehouse_id, material_id, quantity) VALUES ($1, $2, $3)',
+        [warehouse_id, material_id, quantity]
+      );
+    }
+
+    res.json({ message: 'Inventory updated successfully' });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ==================== DELETE MATERIAL (con eliminación de inventario) ====================
+app.delete('/api/materials/:id', authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    
+    // Primero eliminar todas las entradas de inventario en bodegas
+    await client.query('DELETE FROM warehouse_inventory WHERE material_id=$1', [req.params.id]);
+    
+    // Luego eliminar el material
+    await client.query('DELETE FROM materials WHERE id=$1', [req.params.id]);
+    
+    await client.query('COMMIT');
+    res.json({ message: 'Material y su inventario eliminados correctamente' });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
   }
 });
 

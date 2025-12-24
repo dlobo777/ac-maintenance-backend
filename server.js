@@ -532,7 +532,37 @@ app.get('/api/warehouses/:id/inventory', authenticateToken, async (req, res) => 
     res.status(500).json({ error: err.message });
   }
 });
+// ==================== ADD/UPDATE WAREHOUSE INVENTORY ====================
+app.post('/api/warehouses/:id/inventory', authenticateToken, async (req, res) => {
+  const { material_id, quantity } = req.body;
+  const warehouse_id = req.params.id;
+  
+  try {
+    // Check if inventory entry exists
+    const existing = await pool.query(
+      'SELECT * FROM warehouse_inventory WHERE warehouse_id=$1 AND material_id=$2',
+      [warehouse_id, material_id]
+    );
 
+    if (existing.rows.length > 0) {
+      // Update existing inventory (replace with new quantity)
+      await pool.query(
+        'UPDATE warehouse_inventory SET quantity=$1 WHERE warehouse_id=$2 AND material_id=$3',
+        [quantity, warehouse_id, material_id]
+      );
+    } else {
+      // Create new inventory entry
+      await pool.query(
+        'INSERT INTO warehouse_inventory (warehouse_id, material_id, quantity) VALUES ($1, $2, $3)',
+        [warehouse_id, material_id, quantity]
+      );
+    }
+
+    res.json({ message: 'Inventory updated successfully' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 // Transfer materials between warehouses
 app.post('/api/warehouses/transfer', authenticateToken, async (req, res) => {
   const { from_warehouse_id, to_warehouse_id, material_id, quantity } = req.body;

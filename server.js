@@ -100,6 +100,36 @@ async function initDatabase() {
       )
     `);
 
+    // Warehouses table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS warehouses (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        technician_id INTEGER REFERENCES technicians(id),
+        is_main BOOLEAN DEFAULT false,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Warehouse inventory table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS warehouse_inventory (
+        id SERIAL PRIMARY KEY,
+        warehouse_id INTEGER REFERENCES warehouses(id) ON DELETE CASCADE,
+        material_id INTEGER REFERENCES materials(id),
+        quantity INTEGER NOT NULL DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(warehouse_id, material_id)
+      )
+    `);
+
+    // Add closed_by and closed_at to work_orders if not exists
+    await client.query(`
+      ALTER TABLE work_orders 
+      ADD COLUMN IF NOT EXISTS closed_by INTEGER REFERENCES users(id),
+      ADD COLUMN IF NOT EXISTS closed_at TIMESTAMP
+    `);
+
     await client.query('COMMIT');
     console.log('✅ Database tables created');
 
@@ -165,90 +195,7 @@ async function seedData(client) {
     console.error('Seed data error:', err);
   }
 }
-// Backup/Restore endpoints
-app.get('/api/backup/export', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'admin') {
-    return res.status(403).json({ error: 'Admin only' });
-  }
-  
-  try {
-    const backup = {
-      version: '1.0',
-      date: new Date().toISOString(),
-      technicians: (await pool.query('SELECT * FROM technicians')).rows,
-      clients: (await pool.query('SELECT * FROM clients')).rows,
-      work_orders: (await pool.query('SELECT * FROM work_orders')).rows,
-      materials: (await pool.query('SELECT * FROM materials')).rows,
-      users: (await pool.query('SELECT id, username, role, created_at FROM users')).rows
-    };
-    
-    res.setHeader('Content-Type', 'application/json');
-    res.setHeader('Content-Disposition', `attachment; filename=backup-${new Date().toISOString().split('T')[0]}.json`);
-    res.send(JSON.stringify(backup, null, 2));
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
 
-app.post('/api/backup/restore', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'admin') {
-    return res.status(403).json({ error: 'Admin only' });
-  }
-  
-  const client = await pool.connect();
-  try {
-    const { technicians, clients, work_orders, materials } = req.body;
-    
-    await client.query('BEGIN');
-    
-    // Clear existing data (except users)
-    await client.query('DELETE FROM work_order_materials');
-    await client.query('DELETE FROM work_orders');
-    await client.query('DELETE FROM materials');
-    await client.query('DELETE FROM clients');
-    await client.query('DELETE FROM technicians');
-    
-    // Restore technicians
-    for (const tech of technicians || []) {
-      await client.query(
-        'INSERT INTO technicians (id, name, phone, email, specialization, status) VALUES ($1, $2, $3, $4, $5, $6)',
-        [tech.id, tech.name, tech.phone, tech.email, tech.specialization, tech.status]
-      );
-    }
-    
-    // Restore clients
-    for (const cli of clients || []) {
-      await client.query(
-        'INSERT INTO clients (id, name, phone, email, address) VALUES ($1, $2, $3, $4, $5)',
-        [cli.id, cli.name, cli.phone, cli.email, cli.address]
-      );
-    }
-    
-    // Restore materials
-    for (const mat of materials || []) {
-      await client.query(
-        'INSERT INTO materials (id, name, description, stock, unit, min_stock) VALUES ($1, $2, $3, $4, $5, $6)',
-        [mat.id, mat.name, mat.description, mat.stock, mat.unit, mat.min_stock]
-      );
-    }
-    
-    // Restore work orders
-    for (const wo of work_orders || []) {
-      await client.query(
-        'INSERT INTO work_orders (id, client_id, technician_id, title, description, status, priority, scheduled_date, scheduled_time) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)',
-        [wo.id, wo.client_id, wo.technician_id, wo.title, wo.description, wo.status, wo.priority, wo.scheduled_date, wo.scheduled_time]
-      );
-    }
-    
-    await client.query('COMMIT');
-    res.json({ message: 'Backup restored successfully' });
-  } catch (err) {
-    await client.query('ROLLBACK');
-    res.status(500).json({ error: err.message });
-  } finally {
-    client.release();
-  }
-});
 // Auth middleware
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
@@ -520,12 +467,40 @@ app.delete('/api/materials/:id', authenticateToken, async (req, res) => {
 app.get('/api/health', (req, res) => {
   res.json({ status: 'OK', timestamp: new Date().toISOString() });
 });
-app.put('/api/clients/:id', authenticateToken, async (req, res) => {
-  const { name, phone, email, address } = req.body;
+// ==================== WAREHOUSES ====================
+app.get('/api/warehouses', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT w.*, t.name as technician_name 
+      FROM warehouses w
+      LEFT JOIN technicians t ON w.technician_id = t.id
+      ORDER BY w.is_main DESC, w.name
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/warehouses', authenticateToken, async (req, res) => {
+  const { name, technician_id, is_main } = req.body;
+  try {
+    const result = await pool.query(
+      'INSERT INTO warehouses (name, technician_id, is_main) VALUES ($1, $2, $3) RETURNING *',
+      [name, technician_id, is_main]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put('/api/warehouses/:id', authenticateToken, async (req, res) => {
+  const { name, technician_id, is_main } = req.body;
   try {
     await pool.query(
-      'UPDATE clients SET name=$1, phone=$2, email=$3, address=$4 WHERE id=$5',
-      [name, phone, email, address, req.params.id]
+      'UPDATE warehouses SET name=$1, technician_id=$2, is_main=$3 WHERE id=$4',
+      [name, technician_id, is_main, req.params.id]
     );
     res.json({ message: 'Updated' });
   } catch (err) {
@@ -533,10 +508,138 @@ app.put('/api/clients/:id', authenticateToken, async (req, res) => {
   }
 });
 
-app.delete('/api/clients/:id', authenticateToken, async (req, res) => {
+app.delete('/api/warehouses/:id', authenticateToken, async (req, res) => {
   try {
-    await pool.query('DELETE FROM clients WHERE id=$1', [req.params.id]);
+    await pool.query('DELETE FROM warehouses WHERE id=$1', [req.params.id]);
     res.json({ message: 'Deleted' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ==================== WAREHOUSE INVENTORY ====================
+app.get('/api/warehouses/:id/inventory', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT wi.*, m.name, m.unit, m.description
+      FROM warehouse_inventory wi
+      JOIN materials m ON wi.material_id = m.id
+      WHERE wi.warehouse_id = $1
+      ORDER BY m.name
+    `, [req.params.id]);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Transfer materials between warehouses
+app.post('/api/warehouses/transfer', authenticateToken, async (req, res) => {
+  const { from_warehouse_id, to_warehouse_id, material_id, quantity } = req.body;
+  
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Check if source has enough
+    const source = await client.query(
+      'SELECT quantity FROM warehouse_inventory WHERE warehouse_id=$1 AND material_id=$2',
+      [from_warehouse_id, material_id]
+    );
+
+    if (!source.rows[0] || source.rows[0].quantity < quantity) {
+      throw new Error('Cantidad insuficiente en bodega origen');
+    }
+
+    // Decrease from source
+    await client.query(
+      'UPDATE warehouse_inventory SET quantity = quantity - $1 WHERE warehouse_id=$2 AND material_id=$3',
+      [quantity, from_warehouse_id, material_id]
+    );
+
+    // Increase in destination (or create if not exists)
+    const dest = await client.query(
+      'SELECT * FROM warehouse_inventory WHERE warehouse_id=$1 AND material_id=$2',
+      [to_warehouse_id, material_id]
+    );
+
+    if (dest.rows.length === 0) {
+      await client.query(
+        'INSERT INTO warehouse_inventory (warehouse_id, material_id, quantity) VALUES ($1, $2, $3)',
+        [to_warehouse_id, material_id, quantity]
+      );
+    } else {
+      await client.query(
+        'UPDATE warehouse_inventory SET quantity = quantity + $1 WHERE warehouse_id=$2 AND material_id=$3',
+        [quantity, to_warehouse_id, material_id]
+      );
+    }
+
+    await client.query('COMMIT');
+    res.json({ message: 'Transfer successful' });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// ==================== CLOSE ORDER WITH MATERIALS ====================
+app.post('/api/work-orders/:id/close', authenticateToken, async (req, res) => {
+  const { materials } = req.body; // [{ material_id, quantity, warehouse_id }]
+  const orderId = req.params.id;
+  const userId = req.user.id;
+  
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Get work order
+    const order = await client.query('SELECT * FROM work_orders WHERE id=$1', [orderId]);
+    if (!order.rows[0]) throw new Error('Orden no encontrada');
+
+    // Process materials
+    for (const item of materials || []) {
+      // Decrease from warehouse
+      await client.query(
+        'UPDATE warehouse_inventory SET quantity = quantity - $1 WHERE warehouse_id=$2 AND material_id=$3',
+        [item.quantity, item.warehouse_id, item.material_id]
+      );
+
+      // Record material usage
+      await client.query(
+        'INSERT INTO work_order_materials (work_order_id, material_id, quantity) VALUES ($1, $2, $3)',
+        [orderId, item.material_id, item.quantity]
+      );
+    }
+
+    // Update order status
+    await client.query(
+      'UPDATE work_orders SET status=$1, closed_by=$2, closed_at=NOW() WHERE id=$3',
+      ['completed', userId, orderId]
+    );
+
+    await client.query('COMMIT');
+    res.json({ message: 'Order closed successfully' });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// Get materials used in order
+app.get('/api/work-orders/:id/materials', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT wom.*, m.name, m.unit
+      FROM work_order_materials wom
+      JOIN materials m ON wom.material_id = m.id
+      WHERE wom.work_order_id = $1
+    `, [req.params.id]);
+    res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
